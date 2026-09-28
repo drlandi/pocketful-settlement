@@ -125,6 +125,19 @@ stronger story than pretending it never happened.
 Each stage ships as a self-contained, buildable folder. We submit only what's
 actually complete — a solid Stage 1 and 2 beats four half-finished ones.
 
+### Stage 3 priorities
+
+1. **Top priority: the ledger's balance check cannot fail.**
+   `ledger_verify_state` adds every executed transaction's amount to *both*
+   `total_debits` and `total_credits`, so `is_balanced` is true by
+   construction. The conservation check it reports is vacuous: it would say
+   "balanced" even if money had been created or destroyed. The real invariant
+   is that the sum of all account balances equals the sum of initial
+   balances, and nothing checks that today. Until it's fixed, a "verified"
+   result from the service proves nothing about conservation, and the
+   Reconciler has to derive the check itself. (Known limitation #5 in
+   `FACTORY.md`.)
+
 ---
 
 ## Division of work
