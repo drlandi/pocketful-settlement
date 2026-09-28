@@ -38,9 +38,11 @@ BAND agents --HTTP--> api/main.py (FastAPI) --> api/ledger_wrapper.py (ctypes) -
 - **`api/ledger_wrapper.py`** is a thin ctypes binding. The `ctypes.Structure` classes and function signatures must match `ledger.h` exactly, so change both sides together. It converts between dollars (API) and cents (C). Post-transfer balances are read back from the ledger, never computed in Python. `_find_ledger_so()` searches `/app/ledger`, `./ledger`, `../ledger`, then the path relative to the file.
 - **`api/main.py`** maps ledger status to HTTP status on purpose, so agents can branch on the response: invalid account → 404, insufficient balance → 409, invalid amount → 400, concurrent conflict → 503 with `retryable: true`. An idempotent replay returns **200 with `status: "duplicate"`**, not an error. `/transfer` and `/execute` share `_do_transfer`. `/ledger` returns aggregates plus the verification result, not a full dump, because the C API has no JSON dump. `/debug/dump` prints to container stdout.
 
-### Known issue (planned fix in Stage 2)
+### Idempotency
 
-`ledger_transfer()` correctly refuses to move money twice for the same `txn_id`, but it returns `LEDGER_OK` instead of `LEDGER_DUPLICATE_TXN`. `LedgerWrapper.transfer()` works around this with a `get_transaction` pre-check. That check runs outside the mutex and does a linear scan. It fixes the reported signal only; the in-C guard is what prevents a double debit. The proper fix is in `ledger.c`: return `LEDGER_DUPLICATE_TXN` from the existing lookup under the lock, then remove the Python pre-check.
+The duplicate-`txn_id` check lives in `ledger_transfer()`, inside the mutex, and returns `LEDGER_DUPLICATE_TXN` on a replay. Do not add a Python-side pre-check: it would run outside the lock. Only executed transactions are recorded (status 1), so a record exists if and only if the transfer took effect. The Executor's recovery from a lost response depends on that property.
+
+`ledger_verify_state`'s `is_balanced` is true by construction and can never catch a mismatch. That, and the other known gaps, are listed under "Known limitations" in `FACTORY.md`.
 
 ## Repo layout: staged snapshots
 
@@ -53,3 +55,7 @@ Each stage ships as a self-contained, buildable folder (`stage-1/` … `stage-4/
 ## Agent mandates (`mandates/`)
 
 `planner.md`, `executor.md` and `reconciler.md` are pasted into BAND seats. **Hard constraint (disqualifier): mandates must stay generic.** They must not name this project's endpoint paths, field names, error codes or account IDs. They describe roles and decision logic only. Review every mandate edit with that rule in mind.
+
+## FACTORY.md
+
+`FACTORY.md` is the design document judges read first. Keep it factual: every claim has to be traceable to code or to a verification run. Its "Measured costs" section is intentionally all TODOs until agents have run. Never fill it with estimates. When a fix lands or a limitation is closed, update "Status at a glance" and "Known limitations" to match.
