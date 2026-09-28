@@ -1,6 +1,6 @@
 # settlement-agents — Status Brief
 **Dark Factory hackathon · pocketful track · Sep 28, 2026**
-**Repo:** https://github.com/dlandi/pocketful-settlement (public, MIT)
+**Repo:** https://github.com/drlandi/pocketful-settlement (public, MIT)
 **Submission:** Oct 6, 3:59 AM BST · lablab.ai
 
 ---
