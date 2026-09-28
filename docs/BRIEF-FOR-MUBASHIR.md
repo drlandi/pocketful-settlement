@@ -98,18 +98,22 @@ English is fine, I'll implement), that shapes Stage 2 and 3.
 
 ---
 
-## Known issue, documented honestly
+## Known issue, documented honestly — now fixed
 
-The ledger correctly refuses to process a repeated request id — but reports it as
-a plain success rather than flagging it as a repeat. Right now that's compensated
-for in the Python layer with a pre-check. That works, but it sits outside the
-mutex and costs a linear scan per transfer, so it will show under concurrent
-load. The proper fix belongs in the C, beside the existing lookup that already
-runs under the lock. Scheduled for Stage 2.
+**Was:** the ledger correctly refused to process a repeated request id, but
+reported it as a plain success rather than flagging it as a repeat. The Python
+layer compensated with a pre-check that sat outside the mutex and cost a linear
+scan per transfer.
 
-Flagging this because it's the kind of thing worth *showing* in the demo video —
-finding it, reasoning about where the fix belongs, and fixing it there is a
-stronger story than pretending it never happened.
+**Fixed (Sep 28, commit `87d0a83`):** the existing lookup in the C, which already
+runs under the lock, now returns a proper duplicate status, and the Python
+pre-check is gone. Verified in the rebuilt Docker image: the replay comes back as
+`duplicate`, alice stays at $4,950, and the transaction count stays at 1.
+
+This is still worth *showing* in the demo video: finding it, reasoning about
+where the fix belongs, and fixing it there is a stronger story than pretending it
+never happened. The next finding of the same kind is the balance check that
+can't fail (see Stage 3 priorities below).
 
 ---
 
@@ -118,7 +122,7 @@ stronger story than pretending it never happened.
 | Stage | Content | Target | Status |
 |---|---|---|---|
 | 1 | Basic transfers, atomicity, required for eligibility | Sep 28 | ✅ done |
-| 2 | Concurrency, retries, idempotency in C | Sep 29–Oct 1 | next |
+| 2 | Concurrency, retries, idempotency in C | Sep 29–Oct 1 | in progress: idempotency in C ✅ done; concurrency + retries next |
 | 3 | Verification, anomaly detection, recovery | Oct 2–4 | pending |
 | 4 | Edge cases, precision, final hardening | Oct 5 | pending |
 
