@@ -136,7 +136,7 @@ ledger_status_t ledger_create_account(
  * ATOMICITY GUARANTEE:
  *   - If function returns LEDGER_OK: Both debit AND credit were recorded.
  *   - If function returns error: NEITHER debit nor credit occurred (rollback).
- *   - Same call with same txn_id will return same result (idempotent).
+ *   - Replaying a recorded txn_id moves no money and returns LEDGER_DUPLICATE_TXN.
  *
  * Args:
  *   sender_id: Account to debit

@@ -6,7 +6,9 @@
 
 API=${API:-http://localhost:8000}
 
-pp() { python3 -m json.tool 2>/dev/null || cat; }
+# Buffer stdin so the raw text is still available when it isn't pure JSON
+# (POST calls append an "HTTP <code>" line, which json.tool rejects).
+pp() { local s; s=$(cat); python3 -m json.tool <<<"$s" 2>/dev/null || printf '%s\n' "$s"; }
 hr() { echo ""; echo "── $1 ─────────────────────────────────────────"; }
 
 if ! curl -sf "$API/health" >/dev/null 2>&1; then

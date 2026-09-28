@@ -340,32 +340,6 @@ class LedgerWrapper:
         balances, read back from the ledger rather than computed here — if the C side
         did something unexpected, the response shows what the ledger actually holds.
         """
-        # ── Idempotency pre-check ────────────────────────────────────────
-        # ledger_transfer() refuses to move money twice for the same txn_id, but
-        # reports the replay as LEDGER_OK, so callers cannot distinguish a retry
-        # from a first attempt. Looking the transaction up first recovers that.
-        #
-        # This is a SIGNAL fix, not a safety mechanism. There is a window between
-        # this lookup and the call below, so two genuinely concurrent first
-        # attempts with the same txn_id both pass this check — and that is fine:
-        # the duplicate guard inside ledger_transfer runs under the ledger mutex
-        # and is what actually prevents the second debit. The worst outcome of
-        # losing this race is the pre-existing bug (a replay reported as success),
-        # never a double-spend. Moving the check into ledger.c, beside the
-        # existing lookup under the lock, closes the window properly.
-        _, _, existing = self.get_transaction(txn_id)
-        if existing is not None:
-            logger.info("Replay of %s — no transfer performed", txn_id)
-            _, _, prior_sender_balance = self.get_balance(existing["sender_id"])
-            _, _, prior_receiver_balance = self.get_balance(existing["receiver_id"])
-            return LedgerStatus.DUPLICATE_TXN, "Transaction already recorded", {
-                "txn_id": txn_id,
-                "sender_balance": prior_sender_balance,
-                "receiver_balance": prior_receiver_balance,
-                "transferred_amount": existing["amount_dollars"],
-                "recorded_at": existing["timestamp"],
-            }
-
         err = _err_buf()
         amount_cents = dollars_to_cents(amount_dollars)
 
@@ -378,6 +352,11 @@ class LedgerWrapper:
         )
         detail = _decode(err.value)
         message = detail or STATUS_MESSAGES.get(status, "Unknown error")
+
+        if status == LedgerStatus.DUPLICATE_TXN:
+            # Replay detected under the ledger lock; no money moved.
+            logger.info("Replay of %s — no transfer performed", txn_id)
+            return status, message, {"error": message, "code": STATUS_NAMES.get(status)}
 
         if status != LedgerStatus.OK:
             logger.warning("Transfer %s failed (%s): %s", txn_id, STATUS_NAMES.get(status), message)

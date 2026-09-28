@@ -271,20 +271,15 @@ ledger_status_t ledger_transfer(
         return LEDGER_DB_ERROR;
     }
     
-    /* Check if transaction already exists (idempotency) */
-    int existing_txn_idx = find_transaction(txn_id);
-    if (existing_txn_idx != -1) {
-        /* Return same result as before */
-        ledger_transaction_t *txn = &g_ledger.transactions[existing_txn_idx];
-        if (txn->status == 1) {  /* executed */
-            pthread_mutex_unlock(&g_ledger.lock);
-            snprintf(error_msg, LEDGER_MAX_ERROR_MSG_LEN, "OK (idempotent replay)");
-            return LEDGER_OK;
-        } else {
-            pthread_mutex_unlock(&g_ledger.lock);
-            snprintf(error_msg, LEDGER_MAX_ERROR_MSG_LEN, "%s", txn->error_reason);
-            return LEDGER_DUPLICATE_TXN;
-        }
+    /* Check if transaction already exists (idempotency). Done under the lock so
+     * two concurrent attempts with the same txn_id cannot both pass. A replay
+     * moves no money and is reported as DUPLICATE_TXN, never as OK, so callers
+     * can tell a retry from a first attempt. */
+    if (find_transaction(txn_id) != -1) {
+        pthread_mutex_unlock(&g_ledger.lock);
+        snprintf(error_msg, LEDGER_MAX_ERROR_MSG_LEN,
+                 "Transaction already recorded; no funds moved");
+        return LEDGER_DUPLICATE_TXN;
     }
     
     /* Find sender and receiver */
