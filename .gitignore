@@ -219,3 +219,8 @@ __marimo__/
 
 # C object files
 *.o
+
+# Agent seat credentials
+agents/.env
+agents/agent_config.yaml
+agents/.venv/
