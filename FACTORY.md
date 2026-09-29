@@ -2,7 +2,7 @@
 
 **Dark Factory hackathon · pocketful track · submission due Oct 6 2026**
 
-Three AI agents (Planner, Executor, Reconciler) settle payments with no human in the loop. They sit as separate seats in a BAND Desktop room and call an HTTP settlement service. The service is where correctness lives: a C ledger core (integer cents, one mutex, atomic transfers) wrapped in a Python FastAPI layer.
+Three AI agents (Planner, Executor, Reconciler) settle payments with no human in the loop. Each is a Remote Agent registered on app.band.ai and running as its own Python process (`agents/`, Band SDK with the Anthropic adapter). They coordinate in a Band room and call an HTTP settlement service. The service is where correctness lives: a C ledger core (integer cents, one mutex, atomic transfers) wrapped in a Python FastAPI layer.
 
 The track is graded on transaction safety: atomicity, idempotency, concurrency and recovery. This document explains how the design addresses each of those, what we have measured, and what we have not.
 
@@ -16,7 +16,7 @@ The track is graded on transaction safety: atomicity, idempotency, concurrency a
 | 2 | Concurrency, retries, idempotency moved into C | **In progress.** Idempotency is now signalled from C and verified in Docker; concurrency work remains. |
 | 3 | Verification, anomaly detection, recovery | Pending |
 | 4 | Edge cases, precision, final hardening | Pending |
-| — | BAND room, three agent seats, room export, recording | **Not started** |
+| — | Band room, three Remote Agents, room export, recording | **In progress.** Agents run from `agents/`; first end-to-end run completed and recorded (`docs/first-run-log.md`). Room export not yet in the repo. |
 
 Each stage ships as a self-contained, buildable folder (`stage-1/` … `stage-4/`). We submit only completed stages.
 
@@ -27,10 +27,11 @@ Each stage ships as a self-contained, buildable folder (`stage-1/` … `stage-4/
 ```
         External request
                ↓
-        BAND Desktop room
+        Band room (app.band.ai)
         ├── Planner      reads state, approves or rejects; never writes
-        ├── Executor     the only seat that changes state; retries transient failures
+        ├── Executor     the only agent that changes state; retries transient failures
         └── Reconciler   audits recorded state independently; never writes
+          (each agent: own Python process, Band SDK + Anthropic adapter, agents/src/band_seats/)
                ↓ HTTP / JSON
         FastAPI service            api/main.py
                ↓ ctypes
@@ -39,17 +40,17 @@ Each stage ships as a self-contained, buildable folder (`stage-1/` … `stage-4/
 
 ---
 
-## Agent seat setup
+## Agent setup
 
-> **Status: not yet built.** The room, seats, export and recording are outstanding. This section describes the planned configuration.
+The three agents are Band Remote Agents, registered on app.band.ai. Each runs as its own Python process from `agents/` (`uv run planner`, `uv run executor`, `uv run reconciler`), with its own agent ID and API key from `agents/agent_config.yaml` (gitignored). `agents/src/band_seats/seat.py` builds each one the same way: a Band SDK `AnthropicAdapter` whose `prompt=` is the agent's mandate file from `mandates/`, read verbatim, and whose `additional_tools` are that agent's HTTP tools. Using `prompt=` rather than `system_prompt=` keeps the SDK's base instructions (how to reply and @mention in the room) and appends the mandate after them. The tools call the service at `SETTLEMENT_API_URL` (default `http://localhost:8000`).
 
-Each seat is configured with one mandate file from `mandates/` and pointed at the service's base URL (by default `http://localhost:8000` from `stage-1/Dockerfile`).
+The tools live in `agents/src/band_seats/service.py`, and each role module picks its own subset. Tool access therefore enforces the mandates rather than merely describing them:
 
-| Seat | Mandate | Can change state? | Service calls it relies on |
+| Agent | Mandate | Can change state? | Tools (service calls) |
 |---|---|---|---|
-| Planner | `mandates/planner.md` | No | `GET /account/{id}` (existence and balance), `GET /transaction/{txn_id}` (already handled?) |
-| Executor | `mandates/executor.md` | **Yes, the only one** | `POST /execute`, then `GET /transaction/{txn_id}` when a response is lost |
-| Reconciler | `mandates/reconciler.md` | No | `GET /verify`, `GET /ledger`, `GET /transaction/{txn_id}` |
+| Planner | `mandates/planner.md` | No | health (`GET /health`), account lookup (`GET /account/{id}`), transaction lookup (`GET /transaction/{txn_id}`) |
+| Executor | `mandates/executor.md` | **Yes, the only one** | health, execute transfer (`POST /execute`), transaction lookup (for a lost response) |
+| Reconciler | `mandates/reconciler.md` | No | verify (`GET /verify`), ledger overview (`GET /ledger`), account lookup, transaction lookup |
 
 `POST /transfer` and `POST /execute` behave identically. `/execute` is a separate route only so the Executor's calls show up distinctly in service logs and in the room trace.
 
@@ -61,7 +62,25 @@ Each seat is configured with one mandate file from `mandates/` and pointed at th
 
 **Mandate constraint.** The mandates are deliberately generic. They describe roles and decision logic without naming this service's endpoints, field names, error codes or account IDs, because naming them is a disqualifier on this track. Each agent has to discover the service's interface on its own.
 
-**Submission artefacts still required:** `band-room-export.json` and a recording of the room. A missing recording is a stated disqualifier.
+**Submission artefacts:** a recording of the first end-to-end run exists (`docs/first-run-log.md`). `band-room-export.json` is not yet in the repo. A missing recording is a stated disqualifier.
+
+---
+
+## The collaboration
+
+**The crew.** Three Band Remote Agents, each a Band SDK `AnthropicAdapter` process running `claude-sonnet-5-5` (the default in `seat.py`, overridable with `SEAT_MODEL`):
+
+- **Planner** decides whether a request may proceed. It reads state and never moves money.
+- **Executor** carries out approved transfers, exactly once. It is the only agent with a transfer tool.
+- **Reconciler** audits the ledger from fresh state after the fact. It is read-only.
+
+**Who talks to whom.** Routing is by @mention. Under the Band SDK's base instructions, an @mention triggers the mentioned agent's turn, and an agent that is not mentioned stays silent. A human mentions `@planner`. The Planner hands its decision to the Executor, the Executor notifies the Reconciler, and the Reconciler reports the audit, which the Planner checks against what it approved. The Reconciler is deliberately left out of the Planner's approval: its mandate forbids auditing against another agent's summary, so it is brought in only by the Executor, after the fact, and reads the ledger itself. The chain also holds when a message is misrouted. In one session a human sent the request to `@executor` directly. The Executor refused to act without a Planner approval and tagged the Planner itself.
+
+**One typical flow** (first run, `txn_100`):
+
+Human `@planner` "$50 alice→bob, txn_100" → Planner checks health, both accounts and the txn_id (404, unused) → APPROVED to Executor → Executor executes once, txn_id unchanged → Reconciler audits: txn_100 recorded once, alice $4,950, bob $5,050, total $15,000 unchanged → Planner confirms and closes. About 30 seconds, no human input after the first message.
+
+**The delete test.** Without the room nothing settles: the Planner has no tool that moves money, and the Executor refuses any transfer that arrives without a Planner approval.
 
 ---
 
@@ -116,9 +135,9 @@ How each failure mode is handled, and where the handling lives:
 
 | Failure | Handling | Where |
 |---|---|---|
-| Invalid request (unknown account, amount ≤ 0, self-transfer, overdraft) | Rejected before anything is committed. The Planner should catch it first; the ledger rejects it regardless. | Planner mandate; `validate_inputs` and the balance check in `ledger.c` |
-| Same request sent twice | Second attempt moves no money and is reported as a duplicate | Duplicate check under the lock in `ledger_transfer` |
-| Executor's response lost in transit | The Executor queries `GET /transaction/{txn_id}`. A record means the transfer happened; no record means it did not, and it is safe to retry with the same ID. | Executor mandate, step 6 |
+| Invalid request (unknown account, amount ≤ 0, self-transfer, overdraft) | Rejected before anything is committed. The Planner checks each condition against live state; the ledger rejects it regardless. | Planner mandate; `validate_inputs` and the balance check in `ledger.c` |
+| Same request sent twice | Stopped at up to three layers (see below). The ledger layer moves no money and reports a duplicate. | Planner mandate step 5; Executor mandate step 6; duplicate check under the lock in `ledger_transfer` |
+| Executor's response lost, or unclear whether the work landed | The Executor looks up the txn_id before any resubmission. A record means the transfer happened; no record means it did not, and it is safe to retry with the same ID. | Executor mandate, step 6; transaction lookup tool |
 | Transient failure | Retry with backoff, at most three attempts, always with the same ID | Executor mandate, step 5 |
 | Permanent failure | Stop immediately, report, notify the Reconciler | Executor mandate, step 5 |
 | Ledger full while recording | Both legs rolled back before the lock is released; `LEDGER_DB_ERROR` returned | `ledger_transfer` |
@@ -126,13 +145,24 @@ How each failure mode is handled, and where the handling lives:
 
 The lost-response recovery relies on one property: **a record exists if and only if the transfer took effect.** That property holds because the debit, credit and record write happen in one critical section, and only executed transfers are recorded.
 
+### Observed in the first run
+
+`docs/first-run-log.md` records what the agents actually did. Two of the rows above were exercised by agents, not only by `test-api.sh`:
+
+- **The Executor looked up before resubmitting.** After `txn_100` had settled, a human sent the Executor a redundant instruction to proceed with the approved transfer. The Executor did not resubmit. It looked up `txn_100`, found it recorded as executed ($50.00 alice→bob, no error), and reported that resubmitting would only return a duplicate. It added that a further transfer would need a new approval and a new transaction id. The lost-response path in its mandate thus fired on a genuinely ambiguous instruction, not a scripted test.
+- **The Planner rejected a replay.** In an earlier session with the same `txn_id` already recorded, the Planner returned NOT APPROVED with the existing record as evidence. No transfer call was made.
+
+So a replay can be stopped at three independent layers: the Planner at validation, the Executor before resubmitting, and the C ledger under the mutex (`LEDGER_DUPLICATE_TXN`). Only the innermost one guarantees the money is safe. The outer two save a round trip.
+
+The retry-on-transient-failure path and a true lost response (a timeout after the request was sent) have **not** been exercised by agents yet (see Known limitations, item 7).
+
 ---
 
 ## Measured costs
 
-> **PENDING. No agent runs have happened yet, and none of the numbers below have been recorded.** Every row is a TODO. We will fill them only with measured values, and state how each was measured.
+> **PENDING. One end-to-end agent run has happened (`docs/first-run-log.md`), but none of the numbers below have been recorded yet.** Every row is a TODO. We will fill them only with measured values, and state how each was measured.
 
-**Agent layer** (per settled transfer, measured in the BAND room):
+**Agent layer** (per settled transfer, measured in the Band room):
 
 | Metric | Planner | Executor | Reconciler | Total |
 |---|---|---|---|---|
