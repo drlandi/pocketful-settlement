@@ -13,17 +13,23 @@ Money is int64 cents end to end. Dollars only appear at the HTTP boundary.
 
 IDEMPOTENCY NOTE
 ----------------
-ledger_transfer() currently returns LEDGER_OK when replaying a txn_id that is
-already recorded. It correctly refuses to move the money a second time, but the
-return code loses the fact that it was a replay. transfer() below recovers that
-signal with a pre-check — see the comment there for why this is a signal fix and
-not a safety mechanism.
+Replays are detected inside ledger_transfer(), under the ledger lock, which
+returns LEDGER_DUPLICATE_TXN and moves no money. There is deliberately no
+Python-side pre-check: it would run outside the lock and could race.
+
+AMOUNT NOTE
+-----------
+Dollars become cents exactly once, in dollars_to_cents(). It never rounds: an
+amount with more than two decimal places, or one that does not fit in int64
+cents, is rejected as LEDGER_INVALID_AMOUNT. Silently rounding or wrapping an
+amount would move money the caller did not ask for.
 """
 
 import ctypes
 import logging
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +136,46 @@ def cents_to_dollars(cents: int) -> float:
     return cents / 100.0
 
 
-def dollars_to_cents(dollars: float) -> int:
-    """Round rather than truncate: 0.1+0.2 style float noise must not lose a cent."""
-    return int(round(dollars * 100))
+INT64_MAX = 2**63 - 1
+INT64_MIN = -(2**63)
+
+
+class AmountError(ValueError):
+    """An amount that cannot be represented exactly as whole int64 cents."""
+
+
+def dollars_to_cents(dollars: Union[Decimal, int, str, float]) -> int:
+    """Convert dollars to integer cents EXACTLY, or raise AmountError.
+
+    Never rounds and never wraps:
+      * more than two decimal places (0.285, 1.005) is rejected, because binary
+        floats cannot hold such values faithfully and rounding would move a
+        different amount than the one requested;
+      * a result outside int64 is rejected, because ctypes would otherwise
+        truncate it to 64 bits and the C ledger would act on a different number;
+      * NaN and infinity are rejected.
+    Floats are read through their shortest repr, i.e. the digits the caller
+    wrote. Prefer passing Decimal or str.
+    """
+    if isinstance(dollars, bool):
+        raise AmountError("Amount must be a number")
+    try:
+        d = Decimal(repr(dollars)) if isinstance(dollars, float) else Decimal(dollars)
+    except (InvalidOperation, TypeError, ValueError):
+        raise AmountError("Amount is not a valid number") from None
+    if not d.is_finite():
+        raise AmountError("Amount must be finite")
+    if d.adjusted() > 17:  # cheap bound before arithmetic; int64 cents tops out near 9.2e16 dollars
+        raise AmountError("Amount is out of range")
+    with localcontext() as ctx:
+        ctx.prec = 80
+        cents_exact = d * 100
+        if cents_exact != cents_exact.to_integral_value():
+            raise AmountError("Amount must be a whole number of cents (at most two decimal places)")
+        cents = int(cents_exact)
+    if not INT64_MIN <= cents <= INT64_MAX:
+        raise AmountError("Amount is out of range")
+    return cents
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -273,10 +316,16 @@ class LedgerWrapper:
 
     def create_account(self, account_id: str, initial_balance_dollars: float = 0.0) -> Tuple[int, str]:
         """Create an account with a starting balance (dollars in, cents stored)."""
+        try:
+            initial_cents = dollars_to_cents(initial_balance_dollars)
+        except AmountError as exc:
+            logger.warning("Create account %s rejected: %s", account_id, exc)
+            return LedgerStatus.INVALID_AMOUNT, str(exc)
+
         err = _err_buf()
         status = self.ledger_lib.ledger_create_account(
             account_id.encode("utf-8"),
-            dollars_to_cents(initial_balance_dollars),
+            initial_cents,
             err,
         )
         detail = _decode(err.value)
@@ -340,9 +389,14 @@ class LedgerWrapper:
         balances, read back from the ledger rather than computed here — if the C side
         did something unexpected, the response shows what the ledger actually holds.
         """
-        err = _err_buf()
-        amount_cents = dollars_to_cents(amount_dollars)
+        try:
+            amount_cents = dollars_to_cents(amount_dollars)
+        except AmountError as exc:
+            logger.warning("Transfer %s rejected: %s", txn_id, exc)
+            return (LedgerStatus.INVALID_AMOUNT, str(exc),
+                    {"error": str(exc), "code": STATUS_NAMES.get(LedgerStatus.INVALID_AMOUNT)})
 
+        err = _err_buf()
         status = self.ledger_lib.ledger_transfer(
             sender_id.encode("utf-8"),
             receiver_id.encode("utf-8"),
@@ -372,7 +426,8 @@ class LedgerWrapper:
             "txn_id": txn_id,
             "sender_balance": sender_balance,
             "receiver_balance": receiver_balance,
-            "transferred_amount": amount_dollars,
+            # Report the amount the ledger was given, not the caller's raw input.
+            "transferred_amount": cents_to_dollars(amount_cents),
         }
 
     def get_transaction(self, txn_id: str) -> Tuple[int, str, Optional[Dict]]:

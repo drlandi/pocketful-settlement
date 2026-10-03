@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -32,6 +33,7 @@ from ledger_wrapper import (  # noqa: E402
     STATUS_NAMES,
     LedgerStatus,
     LedgerWrapper,
+    dollars_to_cents,
     get_ledger_wrapper,
     init_ledger,
     shutdown_ledger,
@@ -46,7 +48,7 @@ logger = logging.getLogger("pocketful.api")
 # Seed accounts so a fresh container is immediately testable. Judges clone, run,
 # and curl without a setup step. Override with SEED_ACCOUNTS=0.
 SEED_ACCOUNTS = os.environ.get("SEED_ACCOUNTS", "1") == "1"
-SEED_BALANCE = float(os.environ.get("SEED_BALANCE", "5000"))
+SEED_BALANCE = Decimal(os.environ.get("SEED_BALANCE", "5000"))
 SEED_IDS = ["alice", "bob", "carol"]
 
 
@@ -57,13 +59,17 @@ SEED_IDS = ["alice", "bob", "carol"]
 class TransferRequest(BaseModel):
     sender_id: str = Field(..., min_length=1, max_length=255, description="Account to debit")
     receiver_id: str = Field(..., min_length=1, max_length=255, description="Account to credit")
-    amount_dollars: float = Field(..., gt=0, description="Amount in dollars, e.g. 50.00")
+    # Decimal, not float: amounts must be exact to the cent. The wrapper rejects anything
+    # else (more than two decimal places, out of int64 range) as LEDGER_INVALID_AMOUNT.
+    # Positivity is enforced by the ledger (LEDGER_INVALID_AMOUNT -> 400), not here, so every
+    # bad amount reaches an agent in the same shape: HTTP 400 with a machine-readable code.
+    amount_dollars: Decimal = Field(..., description="Amount in dollars, at most two decimal places, e.g. 50.00")
     txn_id: str = Field(..., min_length=1, max_length=63, description="Unique transaction id")
 
 
 class CreateAccountRequest(BaseModel):
     account_id: str = Field(..., min_length=1, max_length=255)
-    initial_balance_dollars: float = Field(0.0, ge=0)
+    initial_balance_dollars: Decimal = Field(Decimal("0"))  # sign and range checked by the ledger
 
 
 class AccountResponse(BaseModel):
@@ -255,6 +261,32 @@ def _do_transfer(req: TransferRequest, wrapper: LedgerWrapper) -> TransferRespon
         # Idempotent replay: the ledger already holds this txn_id, so the retry is
         # not an error. Return the recorded transaction and current balances.
         _, _, txn = wrapper.get_transaction(req.txn_id)
+
+        # ...but only if it is the SAME request. Reusing an id for a different
+        # sender, receiver or amount is a caller bug; answering "duplicate" would
+        # tell it that its request took effect when it did not. Records are
+        # immutable once written, so reading it after the ledger's answer is safe.
+        if txn is not None and (
+            txn["sender_id"] != req.sender_id
+            or txn["receiver_id"] != req.receiver_id
+            or txn["amount_cents"] != dollars_to_cents(req.amount_dollars)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "failed",
+                    "code": "TXN_ID_CONFLICT",
+                    "message": "txn_id is already recorded for a different transfer; no funds moved",
+                    "txn_id": req.txn_id,
+                    "retryable": False,
+                    "recorded": {
+                        "sender_id": txn["sender_id"],
+                        "receiver_id": txn["receiver_id"],
+                        "amount_dollars": txn["amount_dollars"],
+                    },
+                },
+            )
+
         sender_balance = receiver_balance = None
         if txn:
             _, _, sender_balance = wrapper.get_balance(txn["sender_id"])

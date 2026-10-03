@@ -12,11 +12,16 @@
  * payment settlement system. The ledger guarantees:
  *
  * 1. ATOMICITY: Transfers debit/credit atomically or fail completely
- * 2. CONSISTENCY: Ledger state is always valid (sum of balances = total)
- * 3. ISOLATION: Concurrent transfers don't interfere
- * 4. DURABILITY: Once written, transactions persist
+ * 2. CONSISTENCY: The sum of all balances always equals the sum of all
+ *    initial balances (money is neither created nor destroyed).
+ *    ledger_verify_state() checks this.
+ * 3. ISOLATION: Concurrent transfers don't interfere (one global mutex
+ *    serializes every operation, reads included)
  *
- * Thread-safety: All functions are thread-safe via internal locks.
+ * NOT provided: DURABILITY. State lives in process memory only and is lost
+ * on restart. Transactions are recorded for the lifetime of the process.
+ *
+ * Thread-safety: All functions are thread-safe via one internal mutex.
  * Error handling: Functions return status codes; details in error_msg buffer.
  */
 
@@ -31,17 +36,28 @@ typedef enum {
     LEDGER_INSUFFICIENT_BALANCE = 2,/* Not enough funds */
     LEDGER_DUPLICATE_TXN = 3,       /* Transaction ID already recorded */
     LEDGER_INVALID_AMOUNT = 4,      /* Amount <= 0 or precision issue */
-    LEDGER_CONCURRENT_CONFLICT = 5, /* Race condition detected */
+    LEDGER_CONCURRENT_CONFLICT = 5, /* Reserved: never returned (one global lock
+                                       serializes all operations) */
     LEDGER_DB_ERROR = 6,            /* Ledger storage/memory error */
     LEDGER_UNKNOWN_ERROR = 7        /* Unexpected error */
 } ledger_status_t;
 
-/* Maximum sizes */
+/* Maximum sizes. ACCOUNTS and TRANSACTIONS can be overridden at compile time
+ * (-DLEDGER_MAX_TRANSACTIONS=50) so tests can exercise the full-table paths. */
 #define LEDGER_MAX_ACCOUNT_ID_LEN 256
 #define LEDGER_MAX_TXN_ID_LEN 64
 #define LEDGER_MAX_ERROR_MSG_LEN 512
+#ifndef LEDGER_MAX_ACCOUNTS
 #define LEDGER_MAX_ACCOUNTS 10000
+#endif
+#ifndef LEDGER_MAX_TRANSACTIONS
 #define LEDGER_MAX_TRANSACTIONS 100000
+#endif
+
+/* Largest initial balance one account may be created with: 10^14 cents
+ * ($1 trillion). With at most 10,000 accounts the total stays <= 10^18, which
+ * fits in int64 (max ~9.22 * 10^18), so no balance sum can overflow. */
+#define LEDGER_MAX_INITIAL_BALANCE ((int64_t)100000000000000LL)
 
 /* Money is stored as integer cents to avoid floating-point rounding errors.
  * Example: $100.50 = 10050 (cents)
@@ -72,7 +88,7 @@ typedef struct {
     uint32_t num_transactions;
     money_t total_debits;      /* Sum of all outgoing transfers */
     money_t total_credits;     /* Sum of all incoming transfers */
-    int8_t is_balanced;        /* 1 if total_debits == total_credits */
+    int8_t is_balanced;        /* 1 if debits == credits AND balances conserved */
     int8_t has_anomalies;      /* 1 if inconsistencies detected */
     char anomaly_details[512]; /* Description if has_anomalies */
 } ledger_state_t;
@@ -113,9 +129,9 @@ void ledger_destroy(void);
  *
  * Returns:
  *   LEDGER_OK on success
- *   LEDGER_INVALID_ACCOUNT if account_id is NULL or empty
- *   LEDGER_INVALID_AMOUNT if initial_balance < 0
- *   LEDGER_DB_ERROR if account already exists or memory allocation fails
+ *   LEDGER_INVALID_ACCOUNT if account_id is NULL, empty, or >= 256 bytes
+ *   LEDGER_INVALID_AMOUNT if initial_balance < 0 or > LEDGER_MAX_INITIAL_BALANCE
+ *   LEDGER_DB_ERROR if account already exists or the account table is full
  *
  * Thread-safety: Thread-safe (uses internal locks)
  */
@@ -149,10 +165,9 @@ ledger_status_t ledger_create_account(
  *   LEDGER_OK if transfer completed
  *   LEDGER_INVALID_ACCOUNT if sender or receiver doesn't exist
  *   LEDGER_INSUFFICIENT_BALANCE if sender balance < amount
- *   LEDGER_INVALID_AMOUNT if amount <= 0
+ *   LEDGER_INVALID_AMOUNT if amount <= 0, or txn_id is empty or >= 64 bytes
  *   LEDGER_DUPLICATE_TXN if txn_id already recorded
- *   LEDGER_CONCURRENT_CONFLICT if race detected (retry suggested)
- *   LEDGER_DB_ERROR on system failure
+ *   LEDGER_DB_ERROR if the transaction table is full (nothing is changed)
  *
  * Thread-safety: Thread-safe. Concurrent calls are serialized (locked).
  *
@@ -180,7 +195,7 @@ ledger_status_t ledger_transfer(
  *   LEDGER_OK on success
  *   LEDGER_INVALID_ACCOUNT if account doesn't exist
  *
- * Thread-safety: Thread-safe (reads are allowed concurrently)
+ * Thread-safety: Thread-safe (reads take the same global lock as writes)
  */
 ledger_status_t ledger_get_balance(
     const char *account_id,
@@ -196,27 +211,33 @@ ledger_status_t ledger_get_balance(
  * ledger_verify_state(state)
  * Verify ledger consistency and return current state.
  *
- * Checks:
- *   - Sum of all debits == Sum of all credits?
- *   - Any duplicate transaction IDs?
- *   - Any negative balances?
- *   - Any orphaned transactions (recorded but not paired)?
+ * Checks performed:
+ *   - CONSERVATION: the sum of all account balances equals the sum of all
+ *     initial balances. This is the real invariant; it fails if money was
+ *     created or destroyed.
+ *   - No account has a negative balance.
+ *   - Tally of executed transactions (total_debits == total_credits). Both
+ *     sides are summed from the same records, so this alone cannot fail;
+ *     it is kept for compatibility and does not prove conservation.
+ *
+ * NOT checked (would need O(n^2) work under the global lock): duplicate
+ * transaction IDs, orphaned transactions.
  *
  * Args:
- *   state: Out parameter with ledger snapshot
+ *   state: Out parameter with ledger snapshot. is_balanced is 1 only when
+ *          the tally AND the conservation check both pass.
  *
  * Returns:
- *   LEDGER_OK if ledger is consistent
- *   LEDGER_DB_ERROR if verification fails
+ *   LEDGER_OK whenever verification ran, EVEN IF anomalies were found.
+ *     Inspect state->has_anomalies and state->anomaly_details.
+ *   LEDGER_DB_ERROR if the ledger is not initialized or arguments are NULL
  *
  * Thread-safety: Thread-safe (locks ledger during verification)
  *
  * Example:
  *   ledger_state_t state;
- *   ledger_verify_state(&state);
- *   if (state.is_balanced) {
- *       printf("Ledger is healthy\n");
- *   } else {
+ *   ledger_verify_state(&state, err);
+ *   if (state.has_anomalies) {
  *       printf("Anomaly: %s\n", state.anomaly_details);
  *   }
  */
